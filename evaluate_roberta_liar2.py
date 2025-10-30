@@ -79,7 +79,6 @@ class EvaluationResult:
 
 
 class FakeNewsDataset(torch.utils.data.Dataset):
-    """Dataset wrapping tokenised LIAR2 samples for evaluation."""
 
     def __init__(
         self,

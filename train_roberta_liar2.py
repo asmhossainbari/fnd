@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune a RoBERTa model on the LIAR2 fake news dataset.
-"""
+"""Fine-tune a RoBERTa model on the LIAR2 fake news dataset with R-Drop regularization and data augmentation."""
 
 from __future__ import annotations
 
@@ -8,47 +7,15 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Dict, List
-
-try:
-    import pandas as pd
-except ImportError as exc:  # pragma: no cover - pandas required
-    raise SystemExit(
-        f"pandas is required. Install it with `pip install pandas`. (import error: {exc})"
-    ) from exc
-
-try:
-    import torch
-except ImportError as exc:  # pragma: no cover - torch required
-    raise SystemExit(
-        f"PyTorch is required. Install it with `pip install torch`. (import error: {exc})"
-    ) from exc
-
+from typing import Dict, List, Optional
+import pandas as pd
+import torch
 from torch.utils.data import Dataset
-
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError as exc:  # pragma: no cover - tensorboard optional dependency
-    SummaryWriter = None
-    SUMMARY_WRITER_IMPORT_ERROR = exc
-else:
-    SUMMARY_WRITER_IMPORT_ERROR = None
-
-try:
-    import numpy as np
-except ImportError as exc:  # pragma: no cover - numpy required for metrics
-    raise SystemExit(
-        f"numpy is required. Install it with `pip install numpy`. (import error: {exc})"
-    ) from exc
-
-try:
-    from sklearn.metrics import accuracy_score, f1_score
-except ImportError as exc:  # pragma: no cover - optional dependency notice
-    raise SystemExit(
-        f"scikit-learn is required. Install it with `pip install scikit-learn`. (import error: {exc})"
-    ) from exc
 
 try:
     from transformers import (
@@ -65,6 +32,29 @@ except ImportError as exc:  # pragma: no cover - transformers required for train
         f"transformers is required. Install it with `pip install transformers`. (import error: {exc})"
     ) from exc
 
+try:
+    import nltk
+
+    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+    nltk.download('wordnet', quiet=True)
+except ImportError as exc:  # pragma: no cover - nltk required for nlpaug
+    raise SystemExit(
+        f"nltk is required for nlpaug. Install it with `pip install nltk`. (import error: {exc})"
+    ) from exc
+
+try:
+    import nlpaug.augmenter.word as naw
+except ImportError as exc:  # pragma: no cover - nlpaug required for augmentation
+    raise SystemExit(
+        f"nlpaug is required for data augmentation. Install it with `pip install nlpaug`. (import error: {exc})"
+    ) from exc
+
+try:
+    from tqdm import tqdm
+except ImportError as exc:  # pragma: no cover - tqdm for progress bars
+    raise SystemExit(
+        f"tqdm is required for progress tracking. Install it with `pip install tqdm`. (import error: {exc})"
+    ) from exc
 
 
 def _format_numeric_token(value) -> str:
@@ -80,21 +70,104 @@ def _format_numeric_token(value) -> str:
 
 
 class FakeNewsDataset(Dataset):
-    """Torch dataset wrapping tokenised LIAR2 samples."""
+    """Torch dataset wrapping tokenised LIAR2 samples with optional data augmentation."""
 
     def __init__(
-        self,
-        dataframe: pd.DataFrame,
-        tokenizer: AutoTokenizer,
-        text_columns: List[str],
-        numeric_columns: List[str],
-        label_column: str,
-        max_length: int,
+            self,
+            dataframe: pd.DataFrame,
+            tokenizer: AutoTokenizer,
+            text_columns: List[str],
+            numeric_columns: List[str],
+            label_column: str,
+            max_length: int,
+            augment_ratio: float = 0.0,
+            augment_columns: List[str] = ["statement", "justification"],
+            augment_labels: Optional[List[int]] = None,
+            is_training: bool = False,
+            cache_dir: Path = None,
     ) -> None:
         self.tokenizer = tokenizer
         missing_cols = [col for col in text_columns if col not in dataframe.columns]
         if missing_cols:
             raise KeyError(f"Missing text columns in dataframe: {missing_cols}")
+
+        # Initialize augmenters
+        self.augment_ratio = augment_ratio
+        self.augment_columns = augment_columns
+        self.augment_labels = augment_labels
+        self.is_training = is_training
+        self.cache_dir = cache_dir
+
+        if is_training and augment_ratio > 0:
+            # Check for cached augmented data
+            cache_path = None
+            if cache_dir:
+                cache_path = cache_dir / "augmented_train.csv"
+                if cache_path.exists():
+                    print(f"Loading cached augmented data from {cache_path}")
+                    dataframe = pd.read_csv(cache_path)
+                    print(f"Loaded {len(dataframe)} augmented samples")
+                else:
+                    print("No cached augmented data found, generating new augmentations")
+
+            if not cache_path or not cache_path.exists():
+                # Initialize nlpaug augmenters
+                self.synonym_aug = naw.SynonymAug(
+                    aug_src="wordnet", aug_p=0.3, stopwords=None
+                )
+                self.insert_aug = naw.SynonymAug(
+                    aug_src="wordnet", aug_p=0.2, stopwords=None
+                )
+                self.swap_aug = naw.RandomWordAug(
+                    action="swap", aug_p=0.2, stopwords=None
+                )
+                self.delete_aug = naw.RandomWordAug(
+                    action="delete", aug_p=0.1, stopwords=None
+                )
+
+                # Filter dataframe for augmentation if specific labels are provided
+                df_to_augment = dataframe
+                if augment_labels is not None:
+                    df_to_augment = dataframe[dataframe[label_column].isin(augment_labels)]
+                    print(f"Augmenting only samples with labels: {augment_labels}")
+
+                # Prepare augmented data
+                augmented_dfs = [dataframe]
+                num_augmented = int(len(df_to_augment) * augment_ratio)
+
+                print(f"Generating {num_augmented} augmented samples...")
+                for i in tqdm(range(num_augmented), desc="Augmenting data"):
+                    aug_df = df_to_augment.iloc[[i % len(df_to_augment)]].copy()
+                    for col in augment_columns:
+                        if col in text_columns:
+                            # Apply augmentations sequentially
+                            aug_df[col] = aug_df[col].apply(
+                                lambda x: self.synonym_aug.augment(str(x))[0]
+                                if pd.notnull(x) else x
+                            )
+                            aug_df[col] = aug_df[col].apply(
+                                lambda x: self.insert_aug.augment(str(x))[0]
+                                if pd.notnull(x) else x
+                            )
+                            aug_df[col] = aug_df[col].apply(
+                                lambda x: self.swap_aug.augment(str(x))[0]
+                                if pd.notnull(x) else x
+                            )
+                            aug_df[col] = aug_df[col].apply(
+                                lambda x: self.delete_aug.augment(str(x))[0]
+                                if pd.notnull(x) else x
+                            )
+                    augmented_dfs.append(aug_df)
+
+                # Concatenate original and augmented data
+                dataframe = pd.concat(augmented_dfs, ignore_index=True)
+
+                # Cache augmented data if cache_dir is provided
+                if cache_dir:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    dataframe.to_csv(cache_path, index=False)
+                    print(f"Cached augmented data to {cache_path}")
+
         base_text = (
             dataframe[text_columns]
             .fillna("")
@@ -149,7 +222,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         default="roberta-base",
-        help="Hugging Face model identifier to use as the backbone (default: roberta-base)",
+        help="Hugging Face model identifier to use as the backbone if no pretrained model is provided (default: roberta-base)",
+    )
+    parser.add_argument(
+        "--pretrained-model-path",
+        type=Path,
+        default=None,
+        help="Path to a pretrained model directory to load for further training (default: None, uses model-name)",
     )
     parser.add_argument(
         "--text-columns",
@@ -187,7 +266,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("models/liar2_roberta"),
         help="Directory to store model checkpoints and logs",
     )
-    parser.add_argument("--num-epochs", type=float, default=3.0, help="Training epochs")
+    parser.add_argument(
+        "--num-epochs", type=float, default=3.0, help="Training epochs"
+    )
     parser.add_argument(
         "--train-batch-size", type=int, default=16, help="Per-device train batch size"
     )
@@ -232,7 +313,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--loss-type",
-        choices=["ce", "focal"],
+        choices=["ce", "focal", "rdrop"],
         default="ce",
         help="Loss function to use during training (default: ce).",
     )
@@ -251,6 +332,25 @@ def parse_args() -> argparse.Namespace:
             " inverse-frequency weights from the training set."
         ),
     )
+    parser.add_argument(
+        "--rdrop-alpha",
+        type=float,
+        default=5.0,
+        help="Weight for KL divergence term in R-Drop loss (default: 5.0).",
+    )
+    parser.add_argument(
+        "--augment-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of augmented samples to generate per original sample (default: 0.0, no augmentation).",
+    )
+    parser.add_argument(
+        "--augment-labels",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of label IDs to augment (default: None, augment all labels).",
+    )
     return parser.parse_args()
 
 
@@ -261,8 +361,22 @@ def load_split(data_dir: Path, filename: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def load_label_mapping(model_dir: Path) -> Dict[str, Dict]:
+    mapping_path = model_dir / "label_mapping.json"
+    if not mapping_path.is_file():
+        raise FileNotFoundError(
+            f"label_mapping.json not found in {model_dir}. Ensure the pretrained model directory contains label mappings."
+        )
+    with mapping_path.open("r", encoding="utf-8") as fp:
+        raw_mapping = json.load(fp)
+
+    label2id = {str(k): int(v) for k, v in raw_mapping["label2id"].items()}
+    id2label = {int(k): str(v) for k, v in raw_mapping["id2label"].items()}
+    return {"label2id": label2id, "id2label": id2label}
+
+
 def build_label_mapping(
-    df: pd.DataFrame, label_column: str, existing: Dict = None
+        df: pd.DataFrame, label_column: str, existing: Dict = None
 ) -> Dict[str, Dict[int, str]]:
     if existing is None:
         unique_labels = sorted(df[label_column].dropna().unique())
@@ -274,11 +388,11 @@ def build_label_mapping(
         id2label = existing["id2label"]
 
     missing_labels = {
-        str(label) for label in df[label_column].dropna().unique()
-    } - set(label2id.keys())
+                         str(label) for label in df[label_column].dropna().unique()
+                     } - set(label2id.keys())
     if missing_labels:
         raise ValueError(
-            f"Encountered unknown labels {missing_labels} not present in training set."
+            f"Encountered unknown labels {missing_labels} not present in training set or pretrained model."
         )
 
     df[label_column] = df[label_column].astype(str).map(label2id)
@@ -296,27 +410,47 @@ def compute_metrics(eval_pred):
 
 
 class FakeNewsTrainer(Trainer):
-
     def __init__(
-        self,
-        *args,
-        loss_type: str = "ce",
-        focal_gamma: float = 2.0,
-        focal_alpha: torch.Tensor | None = None,
-        **kwargs,
+            self,
+            *args,
+            loss_type: str = "ce",
+            focal_gamma: float = 2.0,
+            focal_alpha: torch.Tensor | None = None,
+            rdrop_alpha: float = 5.0,
+            **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.loss_type = loss_type
         self.focal_gamma = focal_gamma
         self._focal_alpha = focal_alpha
+        self.rdrop_alpha = rdrop_alpha
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
+        # First forward pass
+        outputs1 = model(**inputs)
+        logits1 = outputs1.logits
 
-        if self.loss_type == "focal":
-            log_probs = F.log_softmax(logits, dim=-1)
+        if self.loss_type == "rdrop":
+            # Second forward pass with different dropout
+            outputs2 = model(**inputs)
+            logits2 = outputs2.logits
+
+            # Classification loss (using cross-entropy for both passes)
+            ce_loss1 = F.cross_entropy(logits1, labels, reduction="mean")
+            ce_loss2 = F.cross_entropy(logits2, labels, reduction="mean")
+            ce_loss = (ce_loss1 + ce_loss2) / 2
+
+            # KL divergence between the two forward passes
+            log_probs1 = F.log_softmax(logits1, dim=-1)
+            log_probs2 = F.log_softmax(logits2, dim=-1)
+            kl_loss = (
+                              F.kl_div(log_probs1, log_probs2.softmax(dim=-1), reduction="batchmean") +
+                              F.kl_div(log_probs2, log_probs1.softmax(dim=-1), reduction="batchmean")
+                      ) / 2
+            loss = ce_loss + self.rdrop_alpha * kl_loss
+        elif self.loss_type == "focal":
+            log_probs = F.log_softmax(logits1, dim=-1)
             probs = log_probs.exp()
             alpha = None
             if self._focal_alpha is not None:
@@ -326,9 +460,9 @@ class FakeNewsTrainer(Trainer):
             focal_factor = (1 - pt).clamp(min=0.0) ** self.focal_gamma
             loss = (focal_factor * ce_loss).mean()
         else:
-            loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(logits1, labels)
 
-        return (loss, outputs) if return_outputs else loss
+        return (loss, outputs1) if return_outputs else loss
 
 
 def main() -> None:
@@ -343,11 +477,21 @@ def main() -> None:
     valid_df = load_split(data_dir, "valid.csv")
     test_df = load_split(data_dir, "test.csv")
 
-    label_maps = build_label_mapping(train_df, args.label_column)
+    # Load label mappings, prioritizing pretrained model if provided
+    if args.pretrained_model_path:
+        if not args.pretrained_model_path.exists():
+            raise SystemExit(f"Pretrained model directory does not exist: {args.pretrained_model_path}")
+        label_maps = load_label_mapping(args.pretrained_model_path)
+    else:
+        label_maps = build_label_mapping(train_df, args.label_column)
+
     build_label_mapping(valid_df, args.label_column, existing=label_maps)
     build_label_mapping(test_df, args.label_column, existing=label_maps)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.pretrained_model_path if args.pretrained_model_path else args.model_name,
+        use_fast=True
+    )
 
     train_dataset = FakeNewsDataset(
         train_df,
@@ -356,6 +500,10 @@ def main() -> None:
         args.numeric_columns,
         args.label_column,
         args.max_length,
+        augment_ratio=args.augment_ratio,
+        augment_labels=args.augment_labels,
+        is_training=True,
+        cache_dir=args.output_dir,
     )
     valid_dataset = FakeNewsDataset(
         valid_df,
@@ -364,6 +512,8 @@ def main() -> None:
         args.numeric_columns,
         args.label_column,
         args.max_length,
+        augment_ratio=0.0,  # No augmentation for validation
+        is_training=False,
     )
     test_dataset = FakeNewsDataset(
         test_df,
@@ -372,11 +522,13 @@ def main() -> None:
         args.numeric_columns,
         args.label_column,
         args.max_length,
+        augment_ratio=0.0,  # No augmentation for test
+        is_training=False,
     )
 
     num_labels = len(label_maps["label2id"])
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
+        args.pretrained_model_path if args.pretrained_model_path else args.model_name,
         num_labels=num_labels,
         id2label={idx: label for idx, label in label_maps["id2label"].items()},
         label2id=label_maps["label2id"],
@@ -450,6 +602,7 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_gamma=args.focal_gamma,
         focal_alpha=focal_alpha_tensor,
+        rdrop_alpha=args.rdrop_alpha,
     )
 
     tb_writer = None
