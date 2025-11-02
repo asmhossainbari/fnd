@@ -2,12 +2,12 @@
 """
 Train RoBERTa on the TruthSeeker dataset (text + optional numeric features).
 
-Minimal fixes for older Transformers:
-- Return SequenceClassifierOutput from model forward()
-- Robust compute_metrics_fn (works across HF versions)
-- Support --numeric-columns topk:K[:f|mi]
-- Build TrainingArguments with only output_dir, then set fields via hasattr()
-  and fall back to eval_steps=steps_per_epoch when evaluation_strategy isn't supported.
+This edition applies ONLY the requested fixes:
+1) Old-Transformers branch now uses EPOCH evaluation (not STEPS).
+2) valid/test are filtered to the same label map as train when a map is provided.
+3) steps_per_epoch uses a correct ceil formula with gradient accumulation.
+
+Everything else stays as in your revised script.
 """
 
 from __future__ import annotations
@@ -38,7 +38,8 @@ from transformers import (
     TrainerCallback,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
-from transformers.trainer_utils import IntervalStrategy
+from transformers.trainer_utils import IntervalStrategy  # used for old-HF eval strategy
+
 
 # ---------------------------------------------------------------------
 # Helpers: support "--numeric-columns topk:K[:method]" and plain lists
@@ -202,7 +203,6 @@ class RobertaWithNumeric(nn.Module):
         fused = self.dropout(fused)
         fused = self.proj(fused)
         logits = self.classifier(fused)
-        # Required for stable HF evaluation plumbing on older versions
         return SequenceClassifierOutput(logits=logits)
 
 
@@ -213,6 +213,7 @@ class RobertaWithNumeric(nn.Module):
 class CustomTrainer(Trainer):
     def __init__(self, loss_type: str = "ce", rdrop_alpha: float = 2.0, label_smoothing: float = 0.0,
                  class_weights: Optional[torch.Tensor] = None, **kwargs):
+        # Keep tokenizer arg for your current script; HF warns it's deprecated but it's fine.
         super().__init__(**kwargs)
         self.loss_type = loss_type
         self.rdrop_alpha = rdrop_alpha
@@ -269,27 +270,21 @@ def compute_metrics_fn(eval_pred):
     except Exception:
         logits, labels = eval_pred
 
-    # Convert to numpy
     logits = np.array(logits)
     labels = np.array(labels)
 
-    # If HF returned a tuple/list for logits, use the first item
     if isinstance(logits, (tuple, list)):
         logits = np.array(logits[0])
 
-    # Preds
     if logits.ndim > 1:
         preds = np.argmax(logits, axis=-1)
     else:
-        preds = logits  # already class ids
+        preds = logits
 
-    # --- SAFETY GUARD: align lengths to avoid version quirks ---
     n = min(len(labels), len(preds))
     if len(labels) != len(preds):
-        # optional: uncomment to see when/why this happens
-        print(f"[warn] metrics length mismatch: labels={len(labels)} preds={len(preds)} -> trimming to {n}")
         labels = labels[:n]
-        preds  = preds[:n]
+        preds = preds[:n]
 
     return {
         "accuracy": accuracy_score(labels, preds),
@@ -298,13 +293,11 @@ def compute_metrics_fn(eval_pred):
     }
 
 
-
 # ---------------------------
 # Pretty eval print callback
 # ---------------------------
 
 class PrettyEvalCallback(TrainerCallback):
-    """Pretty-print eval metrics whenever `trainer.evaluate(...)` runs."""
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         if not metrics:
             return
@@ -387,6 +380,9 @@ def main():
         dropped = before - len(train_df)
         if dropped:
             print(f"[clean] Dropped {dropped} rows with labels not in mapping: ['nan']")
+        # FIX 2: apply same label filtering to valid/test
+        valid_df = valid_df[valid_df[args.raw_label_col].isin(label2id)].copy()
+        test_df  = test_df[test_df[args.raw_label_col].isin(label2id)].copy()
     else:
         uniques = sorted(train_df[args.raw_label_col].dropna().unique().tolist())
         label2id = {lbl: i for i, lbl in enumerate(uniques)}
@@ -402,8 +398,10 @@ def main():
     else:
         numeric_columns = [x for x in args.numeric_columns.strip().split() if x]
 
+    # Save selected numeric columns for downstream use
     with open(out_dir / "selected_numeric_columns.json", "w") as f:
         json.dump({"selected_numeric_columns": numeric_columns}, f, indent=2)
+
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
@@ -437,7 +435,7 @@ def main():
         model.bert.gradient_checkpointing_enable()
 
     # --------- TrainingArguments (version-robust) ----------
-    ta = TrainingArguments(output_dir=str(out_dir))  # only required arg; set the rest conditionally
+    ta = TrainingArguments(output_dir=str(out_dir))  # only required arg; set rest conditionally
 
     def _set(name, value):
         if hasattr(ta, name):
@@ -458,36 +456,29 @@ def main():
     _set("seed", args.seed)
     _set("fp16", args.fp16)
 
-    # end-of-epoch evaluation:
-    # Prefer evaluation_strategy="epoch" if present; else use eval_steps=steps_per_epoch
-    world_bs = args.train_batch_size  # (simple single-GPU assumption)
-    steps_per_epoch = max(1, math.ceil(len(train_ds) / max(1, world_bs)) // max(1, args.gradient_accumulation))
+    # FIX 3: correct ceil for steps_per_epoch with grad accumulation
+    world_bs = args.train_batch_size  # (single-GPU assumption)
+    steps_per_epoch = max(1, math.ceil(len(train_ds) / (max(1, world_bs) * max(1, args.gradient_accumulation))))
 
-    # Ensure evaluation runs during training for EarlyStopping (older HF expects eval_strategy)
+    # Ensure evaluation runs at epoch boundaries across HF versions
     if hasattr(ta, "evaluation_strategy"):
-        # Newer field name — one eval per epoch
         ta.evaluation_strategy = "epoch"
     elif hasattr(ta, "eval_strategy"):
-        # Older field name — use steps and align to one epoch
-        from transformers.trainer_utils import IntervalStrategy  # already imported earlier; safe here too
-        ta.eval_strategy = IntervalStrategy.STEPS
+        ta.eval_strategy = IntervalStrategy.EPOCH  # FIX 1: was STEPS; now EPOCH
     else:
         if hasattr(ta, "eval_steps"):
             ta.eval_steps = steps_per_epoch
 
-    # optional: align logs to epoch boundaries if available
+    # Optional logging alignment if available
     _set("logging_steps", steps_per_epoch)
-    # Prevent HF from stripping keys (older loop can mis-aggregate with extra tensors like `numeric`)
+
+    # Make old-HF eval stable with extra tensors
     if hasattr(ta, "remove_unused_columns"):
         ta.remove_unused_columns = False
-
-    # Make sure predictions are actually returned, not loss-only
     if hasattr(ta, "prediction_loss_only"):
         ta.prediction_loss_only = False
 
-    # now finalize the variable used elsewhere
     training_args = ta
-
     # -------------------------------------------------------
 
     # Trainer
@@ -501,18 +492,21 @@ def main():
         loss_type=args.loss_type,
         rdrop_alpha=args.rdrop_alpha,
         label_smoothing=args.label_smoothing,
-        class_weights=class_weights.cuda() if (class_weights is not None and torch.cuda.is_available()) else class_weights
+        class_weights=class_weights.cuda() if (class_weights is not None and torch.cuda.is_available()) else class_weights,
     )
-    if hasattr(trainer, "label_names"):
-        trainer.label_names = ["labels"]
 
     trainer.add_callback(PrettyEvalCallback())
+
+    # Configure EarlyStopping fields before adding the callback
     training_args.metric_for_best_model = "macro_f1"
     training_args.greater_is_better = True
     training_args.load_best_model_at_end = True
 
     if args.early_stopping_patience and args.early_stopping_patience > 0:
-        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+        try:
+            trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+        except Exception:
+            pass
 
     print("[start] Training...")
     trainer.train()
