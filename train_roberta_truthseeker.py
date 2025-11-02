@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.feature_selection import f_classif, mutual_info_classif
-
+from functools import partial
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -371,6 +371,47 @@ class SaveBestByAccuracyCallback(TrainerCallback):
             print(f"[best] Saved new best model (acc={self.best_acc:.6f}) to: {self.best_dir}")
 
 
+def _load_state_dict_safely(model: nn.Module, state_path: Path):
+    ckpt = torch.load(state_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+        ckpt = ckpt["state_dict"]
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
+    print(f"[init] Loaded state_dict from: {state_path}")
+    if missing:
+        print(f"[init] Missing keys ({len(missing)}): {sorted(missing)[:12]}{' ...' if len(missing)>12 else ''}")
+    if unexpected:
+        print(f"[init] Unexpected keys ({len(unexpected)}): {sorted(unexpected)[:12]}{' ...' if len(unexpected)>12 else ''}")
+
+def init_from_path(model: nn.Module, path_like: str):
+    """
+    Rules:
+      - If path contains 'state_dict.pt' -> load into full fused model.
+      - Else if dir contains 'state_dict.pt' -> load that.
+      - Else treat as HF checkpoint dir and load/replace the backbone.
+    """
+    if not path_like:
+        return
+    p = Path(path_like)
+    if p.is_file() and p.name.endswith(".pt"):
+        _load_state_dict_safely(model, p)
+        return
+    if p.is_dir():
+        sd = p / "state_dict.pt"
+        if sd.exists():
+            _load_state_dict_safely(model, sd)
+            return
+        # try HF backbone directory (either this dir, or './backbone')
+        hf_dir = p / "backbone" if (p / "backbone").exists() else p
+        try:
+            hf_backbone = AutoModel.from_pretrained(str(hf_dir), config=model.config)
+            model.bert = hf_backbone
+            print(f"[init] Initialized backbone from HF dir: {hf_dir}")
+        except Exception as e:
+            raise ValueError(f"Could not initialize from '{path_like}': {e}") from e
+    else:
+        raise ValueError(f"Invalid --pretrained-weights path: {path_like}")
+
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -410,6 +451,8 @@ def main():
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--early-stopping-patience", type=int, default=0, help=">0 enables early stopping")
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--pretrained", default="", help="Path to init weights. Either a directory with state_dict.pt (your saved best) or a HF checkpoint dir. If set, training starts from these weights.")
+
 
     args = parser.parse_args()
 
@@ -508,6 +551,9 @@ def main():
     if args.gradient_checkpointing and hasattr(model.bert, "gradient_checkpointing_enable"):
         model.bert.gradient_checkpointing_enable()
 
+        # NEW: Initialize from user-provided pretrained weights (if any)
+    if args.pretrained_weights:
+        init_from_path(model, args.pretrained)
     # --------- TrainingArguments (version-robust) ----------
     ta = TrainingArguments(output_dir=str(out_dir))  # only required arg; set rest conditionally
 
