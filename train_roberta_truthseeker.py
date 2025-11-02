@@ -336,29 +336,40 @@ class SaveBestByAccuracyCallback(TrainerCallback):
         acc = metrics.get("eval_accuracy", metrics.get("accuracy"))
         if acc is None:
             return
+
         if acc > self.best_acc:
-            self.best_acc = acc
+            self.best_acc = float(acc)
             self.best_epoch = int(state.epoch) if state.epoch is not None else None
             self.best_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save weights/config
-            if hasattr(model, "save_pretrained"):
-                model.save_pretrained(self.best_dir)
-            # Save tokenizer
-            if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
-                self.tokenizer.save_pretrained(self.best_dir)
+            # 1) ALWAYS save your custom model’s weights
+            torch.save(model.state_dict(), self.best_dir / "state_dict.pt")
 
-            # Save helpers: label map + numeric columns
+            # 2) (Nice to have) save the backbone in HF format for inspection
+            try:
+                if hasattr(model, "bert") and hasattr(model.bert, "save_pretrained"):
+                    (self.best_dir / "backbone").mkdir(exist_ok=True)
+                    model.bert.save_pretrained(self.best_dir / "backbone")
+            except Exception as e:
+                print(f"[best] backbone save_pretrained failed: {e}")
+
+            # 3) Save tokenizer (if available)
+            try:
+                if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
+                    self.tokenizer.save_pretrained(self.best_dir)
+            except Exception as e:
+                print(f"[best] tokenizer save_pretrained failed: {e}")
+
+            # 4) Save helpers for reproducibility
             with open(self.best_dir / "label_mapping.json", "w") as f:
                 json.dump(self.label2id, f, indent=2)
             with open(self.best_dir / "selected_numeric_columns.json", "w") as f:
                 json.dump({"selected_numeric_columns": self.selected_numeric_columns}, f, indent=2)
-
-            # Record which metric triggered the save
             with open(self.best_dir / "best_metrics.json", "w") as f:
-                json.dump({"best_eval_accuracy": float(acc), "epoch": self.best_epoch}, f, indent=2)
+                json.dump({"best_eval_accuracy": self.best_acc, "epoch": self.best_epoch}, f, indent=2)
 
-            print(f"[best] Saved new best model (acc={acc:.6f}) to: {self.best_dir}")
+            print(f"[best] Saved new best model (acc={self.best_acc:.6f}) to: {self.best_dir}")
+
 
 # ---------------------------
 # Main
@@ -522,6 +533,9 @@ def main():
     # FIX 3: correct ceil for steps_per_epoch with grad accumulation
     world_bs = args.train_batch_size  # (single-GPU assumption)
     steps_per_epoch = max(1, math.ceil(len(train_ds) / (max(1, world_bs) * max(1, args.gradient_accumulation))))
+    total_steps = steps_per_epoch * max(1, args.num_epochs)
+    if hasattr(ta, "warmup_steps"):
+        ta.warmup_steps = int(total_steps * float(args.warmup_ratio))
 
     # Ensure evaluation runs at epoch boundaries across HF versions
     if hasattr(ta, "evaluation_strategy"):
