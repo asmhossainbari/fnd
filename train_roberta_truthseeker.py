@@ -130,6 +130,8 @@ class TruthSeekerDataset(Dataset):
         label2id: Dict[str, int],
         numeric_columns: Optional[List[str]] = None,
         max_length: int = 256,
+        numeric_mean: Optional[Dict[str, float]] = None,
+        numeric_std: Optional[Dict[str, float]] = None,
     ):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
@@ -157,8 +159,13 @@ class TruthSeekerDataset(Dataset):
         self.labels = torch.tensor([self.label2id[x] for x in self.df[self.label_column].tolist()], dtype=torch.long)
 
         if self.numeric_columns:
-            num = self.df[self.numeric_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
-            self.numeric = torch.tensor(num, dtype=torch.float32)
+            num_df = self.df[self.numeric_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            if numeric_mean is not None and numeric_std is not None:
+                for c in self.numeric_columns:
+                    mu = float(numeric_mean.get(c, 0.0))
+                    sd = float(numeric_std.get(c, 1.0)) or 1.0  # protect against 0
+                    num_df[c] = (num_df[c] - mu) / sd
+                self.numeric = torch.tensor(num_df.values, dtype=torch.float32)
         else:
             self.numeric = None
 
@@ -441,13 +448,30 @@ def main():
     with open(out_dir / "selected_numeric_columns.json", "w") as f:
         json.dump({"selected_numeric_columns": numeric_columns}, f, indent=2)
 
+    # ---- Standardize numeric features (train statistics) ----
+    numeric_mean = None
+    numeric_std = None
+    if numeric_columns:
+        train_num_df = train_df[numeric_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        # population std (ddof=0) is fine; protect zeros by replacing with 1.0
+        mean_s = train_num_df.mean()
+        std_s = train_num_df.std(ddof=0).replace(0.0, 1.0)
+        numeric_mean = {c: float(mean_s[c]) for c in numeric_columns}
+        numeric_std = {c: float(std_s[c]) for c in numeric_columns}
+        # Persist stats for evaluation scripts/inference
+
+        with open(out_dir / "numeric_standardization.json", "w") as f:
+            json.dump(
+                {"columns": numeric_columns, "mean": numeric_mean, "std": numeric_std},
+                f, indent=2
+            )
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
     # Datasets
-    train_ds = TruthSeekerDataset(train_df, tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length)
-    valid_ds = TruthSeekerDataset(valid_df, tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length)
-    test_ds  = TruthSeekerDataset(test_df,  tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length)
+    train_ds = TruthSeekerDataset(train_df, tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length, numeric_mean=numeric_mean, numeric_std=numeric_std)
+    valid_ds = TruthSeekerDataset(valid_df, tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length, numeric_mean=numeric_mean, numeric_std=numeric_std)
+    test_ds  = TruthSeekerDataset(test_df,  tokenizer, text_columns, args.raw_label_col, label2id, numeric_columns, max_length=args.max_length, numeric_mean=numeric_mean, numeric_std=numeric_std)
 
     num_labels = len(label2id)
     numeric_dim = train_ds.numeric.shape[1] if train_ds.numeric is not None else 0
