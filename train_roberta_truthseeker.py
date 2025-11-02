@@ -39,7 +39,7 @@ from transformers import (
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.trainer_utils import IntervalStrategy  # used for old-HF eval strategy
-
+from transformers import TrainerCallback
 
 # ---------------------------------------------------------------------
 # Helpers: support "--numeric-columns topk:K[:method]" and plain lists
@@ -313,6 +313,45 @@ class PrettyEvalCallback(TrainerCallback):
 
         print(f"[{epoch_str}] val_loss={_fmt(loss)}  accuracy={_fmt(acc)}  macro_f1={_fmt(macro)}  micro_f1={_fmt(micro)}")
 
+class SaveBestByAccuracyCallback(TrainerCallback):
+    def __init__(self, best_dir: Path, tokenizer, label2id: dict, selected_numeric_columns: list):
+        self.best_dir = Path(best_dir)
+        self.best_dir.mkdir(parents=True, exist_ok=True)
+        self.tokenizer = tokenizer
+        self.label2id = label2id
+        self.selected_numeric_columns = selected_numeric_columns
+        self.best_acc = float("-inf")
+        self.best_epoch = None
+
+    def on_evaluate(self, args, state, control, metrics=None, model=None, **kwargs):
+        if not metrics:
+            return
+        acc = metrics.get("eval_accuracy", metrics.get("accuracy"))
+        if acc is None:
+            return
+        if acc > self.best_acc:
+            self.best_acc = acc
+            self.best_epoch = int(state.epoch) if state.epoch is not None else None
+            self.best_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save weights/config
+            if hasattr(model, "save_pretrained"):
+                model.save_pretrained(self.best_dir)
+            # Save tokenizer
+            if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
+                self.tokenizer.save_pretrained(self.best_dir)
+
+            # Save helpers: label map + numeric columns
+            with open(self.best_dir / "label_mapping.json", "w") as f:
+                json.dump(self.label2id, f, indent=2)
+            with open(self.best_dir / "selected_numeric_columns.json", "w") as f:
+                json.dump({"selected_numeric_columns": self.selected_numeric_columns}, f, indent=2)
+
+            # Record which metric triggered the save
+            with open(self.best_dir / "best_metrics.json", "w") as f:
+                json.dump({"best_eval_accuracy": float(acc), "epoch": self.best_epoch}, f, indent=2)
+
+            print(f"[best] Saved new best model (acc={acc:.6f}) to: {self.best_dir}")
 
 # ---------------------------
 # Main
@@ -507,6 +546,16 @@ def main():
             trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
         except Exception:
             pass
+
+    best_dir = Path(out_dir) / "best_model"
+    trainer.add_callback(
+        SaveBestByAccuracyCallback(
+            best_dir=best_dir,
+            tokenizer=tokenizer,
+            label2id=label2id,
+            selected_numeric_columns=numeric_columns,
+        )
+    )
 
     print("[start] Training...")
     trainer.train()
