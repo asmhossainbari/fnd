@@ -552,7 +552,7 @@ def main():
         model.bert.gradient_checkpointing_enable()
 
         # NEW: Initialize from user-provided pretrained weights (if any)
-    if args.pretrained_weights:
+    if args.pretrained:
         init_from_path(model, args.pretrained)
     # --------- TrainingArguments (version-robust) ----------
     ta = TrainingArguments(output_dir=str(out_dir))  # only required arg; set rest conditionally
@@ -593,7 +593,7 @@ def main():
             ta.eval_steps = steps_per_epoch
 
     # Optional logging alignment if available
-    _set("logging_steps", steps_per_epoch)
+    _set("logging_steps", 100)
 
     # Make old-HF eval stable with extra tensors
     if hasattr(ta, "remove_unused_columns"):
