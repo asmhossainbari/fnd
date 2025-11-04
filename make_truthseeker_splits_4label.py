@@ -165,6 +165,9 @@ def main():
     ap.add_argument("--label-map-json", default=None,
                     help="Optional explicit path for the label-map JSON. "
                          "Default: <output-dir>/label_mapping_4label.json")
+    ap.add_argument("--train-subsample", action="store_true",
+                    help="If set, stratify-subsample 20% of the TRAIN split and use that as train.csv.")
+
     args = ap.parse_args()
 
     ts_path = Path(args.truthseeker_csv)
@@ -185,9 +188,28 @@ def main():
 
     # 3) Clean target: trim and drop blank
     before = len(ts)
+    # ts[TARGET_COL] = ts[TARGET_COL].astype(str).str.strip()
+    # ts = ts[ts[TARGET_COL].ne("") & ts[TARGET_COL].ne("nan") & ts[TARGET_COL].ne("None")]
+    # dropped_empty_target = before - len(ts)
+
+    nan_count_true = ts[TARGET_COL].isna().sum()
+    if nan_count_true:
+        print(f"WARNING: Dropping {nan_count_true} rows with NaN in '{TARGET_COL}'")
+    ts = ts.dropna(subset=[TARGET_COL])
+
     ts[TARGET_COL] = ts[TARGET_COL].astype(str).str.strip()
-    ts = ts[ts[TARGET_COL].ne("") & ts[TARGET_COL].ne("nan") & ts[TARGET_COL].ne("None")]
-    dropped_empty_target = before - len(ts)
+    bad_placeholders = {"", "nan", "NaN", "None", "NULL"}
+    mask_bad = ts[TARGET_COL].isin(bad_placeholders)
+    dropped_empty_target = int(mask_bad.sum())
+    ts = ts.loc[~mask_bad].copy()
+
+    # Final sanity check on cleaned label column (pre-merge)
+    if ts[TARGET_COL].isna().any():
+        n = int(ts[TARGET_COL].isna().sum())
+        sample_idx = ts[ts[TARGET_COL].isna()].index[:5].tolist()
+        sys.exit(
+            f"ERROR: Found {n} NaN values in '{TARGET_COL}' after initial cleaning; sample indices: {sample_idx}"
+        )
 
     # 4) Remove NO MAJORITY rows
     before = len(ts)
@@ -228,6 +250,34 @@ def main():
     # 10) STRICT stratified split
     train_df, valid_df, test_df = stratified_three_way(merged, TARGET_COL, args.seed)
 
+    for name, df in [("train", train_df), ("valid", valid_df), ("test", test_df)]:
+        if df[TARGET_COL].isna().any():
+            n = int(df[TARGET_COL].isna().sum())
+            sys.exit(f"ERROR: {name}.csv contains {n} NaN values in '{TARGET_COL}' after splitting.")
+
+
+    # Optional: subsample 20% of the TRAIN split (stratified) for train.csv
+    if args.train_subsample:
+        from sklearn.model_selection import StratifiedShuffleSplit
+        y_train = train_df[TARGET_COL].values
+        try:
+            sss = StratifiedShuffleSplit(n_splits=1, train_size=0.20, random_state=args.seed)
+            (sub_idx, _), = sss.split(train_df, y_train)
+            original_train_n = len(train_df)
+            train_df = train_df.iloc[sub_idx].reset_index(drop=True)
+            print(f"[train-subsample] Reduced train split from {original_train_n} -> {len(train_df)} "
+                  f"(20% stratified of the 80% train split).")
+            # Show per-class counts of the new (smaller) train
+            print_class_counts(train_df, "Train (subsampled)")
+        except ValueError as e:
+            # If a tiny class prevents stratification, fail with helpful counts
+            counts = train_df[TARGET_COL].value_counts().sort_index()
+            sys.exit(
+                "ERROR: Stratified 20% subsample of the TRAIN split failed. "
+                f"Reason: {e}\nPer-class counts in original train split:\n{counts.to_string()}"
+            )
+
+
     # 11) Save splits
     train_p = out_dir / "train.csv"
     valid_p = out_dir / "valid.csv"
@@ -235,6 +285,10 @@ def main():
     train_df.to_csv(train_p, index=False)
     valid_df.to_csv(valid_p, index=False)
     test_df.to_csv(test_p, index=False)
+
+    if merged[TARGET_COL].isna().any():
+        n = int(merged[TARGET_COL].isna().sum())
+        sys.exit(f"ERROR: Found {n} NaN values in '{TARGET_COL}' in merged dataset before writing label map.")
 
     # 12) Write label-map JSON
     label_map_path = Path(args.label_map_json) if args.label_map_json else (out_dir / "label_mapping_4label.json")
