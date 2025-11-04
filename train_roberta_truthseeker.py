@@ -40,6 +40,7 @@ from transformers import (
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.trainer_utils import IntervalStrategy  # used for old-HF eval strategy
 from transformers import TrainerCallback
+from imblearn.over_sampling import RandomOverSampler
 
 # ---------------------------------------------------------------------
 # Helpers: support "--numeric-columns topk:K[:method]" and plain lists
@@ -219,13 +220,14 @@ class RobertaWithNumeric(nn.Module):
 
 class CustomTrainer(Trainer):
     def __init__(self, loss_type: str = "ce", rdrop_alpha: float = 2.0, label_smoothing: float = 0.0,
-                 class_weights: Optional[torch.Tensor] = None, **kwargs):
+                 class_weights: Optional[torch.Tensor] = None, focal_gamma: float = 2.0, **kwargs):
         # Keep tokenizer arg for your current script; HF warns it's deprecated but it's fine.
         super().__init__(**kwargs)
         self.loss_type = loss_type
         self.rdrop_alpha = rdrop_alpha
         self.label_smoothing = label_smoothing
         self.class_weights = class_weights
+        self.focal_gamma = focal_gamma
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
@@ -252,6 +254,21 @@ class CustomTrainer(Trainer):
             q_target = F.softmax(logits2, dim=-1).detach()
             kl = F.kl_div(p, q_target, reduction="batchmean") + F.kl_div(q, p_target, reduction="batchmean")
             loss = (loss1 + loss2) / 2 + self.rdrop_alpha * kl
+        elif self.loss_type == "focal":
+            ce = F.cross_entropy(
+                logits.view(-1, self.model.config.num_labels),
+                labels.view(-1),
+                weight=None,
+                label_smoothing=self.label_smoothing,
+                reduction="none",
+            )
+            probs = F.softmax(logits, dim=-1)
+            pt = torch.gather(probs, dim=1, index=labels.unsqueeze(1)).squeeze(1)
+            focal_factor = (1 - pt) ** self.focal_gamma
+            if self.class_weights is not None:
+                alpha = self.class_weights[labels]
+                focal_factor = alpha * focal_factor
+            loss = (focal_factor * ce).mean()
         else:
             loss = F.cross_entropy(
                 logits.view(-1, self.model.config.num_labels),
@@ -442,17 +459,18 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # Loss/options
-    parser.add_argument("--loss-type", choices=["ce", "rdrop"], default="ce")
+    parser.add_argument("--loss-type", choices=["ce", "rdrop", "focal"], default="ce")
     parser.add_argument("--rdrop-alpha", type=float, default=2.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--use-class-weights", action="store_true")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
 
     # Misc
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--early-stopping-patience", type=int, default=0, help=">0 enables early stopping")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--pretrained", default="", help="Path to init weights. Either a directory with state_dict.pt (your saved best) or a HF checkpoint dir. If set, training starts from these weights.")
-
+    parser.add_argument("--oversample", action="store_true")
 
     args = parser.parse_args()
 
@@ -487,6 +505,14 @@ def main():
         uniques = sorted(train_df[args.raw_label_col].dropna().unique().tolist())
         label2id = {lbl: i for i, lbl in enumerate(uniques)}
     id2label = {v: k for k, v in label2id.items()}
+
+    if args.oversample:
+        ros = RandomOverSampler(random_state=args.seed)
+        X = train_df.drop(columns=[args.raw_label_col])
+        y = train_df[args.raw_label_col]
+        X_res, y_res = ros.fit_resample(X, y)
+        train_df = pd.concat([X_res, pd.Series(y_res, name=args.raw_label_col)], axis=1)
+        print(f"[oversample] Resampled train from {before} to {len(train_df)} examples")
 
     # Columns
     text_columns = [x for x in args.text_columns.strip().split() if x]
@@ -616,6 +642,7 @@ def main():
         rdrop_alpha=args.rdrop_alpha,
         label_smoothing=args.label_smoothing,
         class_weights=class_weights.cuda() if (class_weights is not None and torch.cuda.is_available()) else class_weights,
+        focal_gamma=args.focal_gamma,
     )
 
     trainer.add_callback(PrettyEvalCallback())
